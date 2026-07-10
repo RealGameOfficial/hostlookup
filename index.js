@@ -10,15 +10,11 @@ const port = process.env.PORT || 10000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- BELLEKTE TUTULAN BASİT SİSTEMLER (VERİTABANI GEREKTİRMEZ) ---
-
-// 1. Basit Captcha Sistemi (Sunucu tarafında geçici session mantığı)
-// Render ücretsiz planda restart atarsa sıfırlanır, test için idealdir.
+// --- BELLEKTE TUTULAN BASİT SİSTEMLER ---
 const activeCaptchas = {}; 
 
-// 2. Rate Limiting (Dakikada 60 İstek Sınırı)
 const apiRequestCounts = {};
-setInterval(() => { Object.keys(apiRequestCounts).forEach(k => delete apiRequestCounts[k]); }, 60000); // Her dakika temizler
+setInterval(() => { Object.keys(apiRequestCounts).forEach(k => delete apiRequestCounts[k]); }, 60000);
 
 function rateLimiter(req, res, next) {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -31,7 +27,7 @@ function rateLimiter(req, res, next) {
     next();
 }
 
-// --- HELPER FONKSİYONLAR (VERİ AYRIŞTIRICI) ---
+// --- HELPER FONKSİYONLAR ---
 function parseWhois(rawText) {
     const info = {
         registrar: 'Bilinmiyor',
@@ -58,7 +54,7 @@ function parseWhois(rawText) {
     return info;
 }
 
-// --- 1. KAPI: DEVELOPER API (Doğrulama Yok - Doğrudan Erişim) ---
+// --- 1. KAPI: DEVELOPER API ---
 app.get('/api/v1/domain', rateLimiter, (req, res) => {
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'Target parametresi eksik' });
@@ -95,7 +91,6 @@ app.get('/api/v1/ping', rateLimiter, (req, res) => {
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'Target parametresi eksik' });
 
-    // Güvenlik filtrelemesi (Komut enjeksiyonunu önlemek için sadece harf, rakam ve nokta)
     const cleanTarget = target.replace(/[^a-zA-Z0-9.]/g, '');
 
     exec(`ping -c 4 ${cleanTarget}`, (err, stdout, stderr) => {
@@ -104,15 +99,13 @@ app.get('/api/v1/ping', rateLimiter, (req, res) => {
     });
 });
 
-
-// --- FRONTEND İÇİN GEÇİCİ CAPTCHA GENERATOR ---
+// --- CAPTCHA GENERATOR ---
 app.get('/api/captcha/generate', (req, res) => {
     const captchaId = Math.random().toString(36).substring(2, 9);
-    const code = Math.random().toString(36).substring(2, 7).toUpperCase(); // 5 haneli kod
+    const code = Math.random().toString(36).substring(2, 7).toUpperCase();
     
     activeCaptchas[captchaId] = code;
 
-    // Harici kütüphane yüklememek için SVG formatında dinamik resim üretiyoruz
     const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="130" height="45" viewBox="0 0 130 45">
         <rect width="100%" height="100%" fill="#2a2a2a"/>
@@ -125,17 +118,14 @@ app.get('/api/captcha/generate', (req, res) => {
     res.json({ id: captchaId, svg: Buffer.from(svg).toString('base64') });
 });
 
-
-// --- 2. KAPI: FRONTEND API (Captcha Doğrulamalı Güvenli Sistem) ---
+// --- 2. KAPI: FRONTEND API ---
 app.post('/api/frontend/query', rateLimiter, async (req, res) => {
     const { type, target, captchaId, captchaCode } = req.body;
 
-    // Captcha Kontrolü
     if (!captchaId || !activeCaptchas[captchaId] || activeCaptchas[captchaId] !== captchaCode?.toUpperCase()) {
         return res.status(400).json({ error: 'Güvenlik kodu (Captcha) hatalı veya süresi dolmuş!' });
     }
     
-    // Kullanılan captchayı imha et (Re-use önlemek için)
     delete activeCaptchas[captchaId];
 
     if (type === 'domain') {
@@ -168,8 +158,7 @@ app.post('/api/frontend/query', rateLimiter, async (req, res) => {
     }
 });
 
-
-// --- ANA SAYFA (MODERN PANELSİZ ARAYÜZ) ---
+// --- ANA SAYFA ---
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -213,7 +202,7 @@ app.get('/', (req, res) => {
             <div class="tabs">
                 <button class="tab-btn active" onclick="setMode('domain', 'Örn: google.com')">Domain Sorgula</button>
                 <button class="tab-btn" onclick="setMode('ip', 'Örn: 8.8.8.8')">IP Sorgula</button>
-                <button class="tab-btn" onclick="setMode('ping', 'Örn: google.com veya IP')">Ping At</button>
+                <button class="tab-btn" onclick="setMode('ping', 'Örn: google.com')">Ping At</button>
             </div>
 
             <div class="card">
@@ -230,10 +219,7 @@ app.get('/', (req, res) => {
                     </div>
                 </div>
 
-                <!-- Dinamik Modern Kartlar -->
                 <div class="results-grid" id="gridOutput" style="display: none;"></div>
-
-                <!-- Detaylı Ham Çıktı Kutusu -->
                 <div class="raw-output" id="rawOutput" style="display: none;"></div>
             </div>
         </div>
@@ -246,7 +232,7 @@ app.get('/', (req, res) => {
                 currentMode = mode;
                 document.getElementById('targetInput').placeholder = placeholder;
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-                event.target.classList.add('active');
+                if(event) event.target.classList.add('active');
                 clearOutputs();
             }
 
@@ -295,33 +281,31 @@ app.get('/', (req, res) => {
 
                     if(data.error) {
                         raw.innerText = 'Hata: ' + data.error;
-                        loadCaptcha(); // Başarısızlıkta captchayı yenile
+                        loadCaptcha();
                         return;
                     }
 
-                    // Görsel Grid Tasarımını Doldurma
                     grid.innerHTML = '';
                     if(currentMode === 'domain') {
-                        grid.innerHTML = `
-                            <div class="result-item"><label>Kayıt Şirketi (Registrar)</label><span>${data.registrar}</span></div>
-                            <div class="result-item"><label>Kayıt Tarihi</label><span>${data.creationDate}</span></div>
-                            <div class="result-item"><label>Bitiş Tarihi (Expiry)</label><span>${data.expiryDate}</span></div>
-                        `;
+                        grid.innerHTML = \`
+                            <div class="result-item"><label>Kayıt Şirketi (Registrar)</label><span>\${data.registrar}</span></div>
+                            <div class="result-item"><label>Kayıt Tarihi</label><span>\${data.creationDate}</span></div>
+                            <div class="result-item"><label>Bitiş Tarihi (Expiry)</label><span>\${data.expiryDate}</span></div>
+                        \`;
                         raw.innerText = data.raw || 'Ham veri bulunamadı.';
                         grid.style.display = 'grid';
                     } else if(currentMode === 'ip') {
-                        grid.innerHTML = `
-                            <div class="result-item"><label>Tahmini Lokasyon</label><span>${data.location}</span></div>
-                            <div class="result-item"><label>Servis Sağlayıcı (ISP)</label><span>${data.isp}</span></div>
-                            <div class="result-item"><label>Hat Türü</label><span>${data.infrastructure}</span></div>
-                        `;
+                        grid.innerHTML = \`
+                            <div class="result-item"><label>Tahmini Lokasyon</label><span>\${data.location}</span></div>
+                            <div class="result-item"><label>Servis Sağlayıcı (ISP)</label><span>\${data.isp}</span></div>
+                            <div class="result-item"><label>Hat Türü</label><span>\${data.infrastructure}</span></div>
+                        \`;
                         raw.innerText = data.raw;
                         grid.style.display = 'grid';
                     } else if(currentMode === 'ping') {
                         raw.innerText = data.raw;
                     }
 
-                    // Her başarılı işlemden sonra güvenlik için captchayı yenile
                     loadCaptcha();
 
                 } catch(err) {
@@ -330,7 +314,6 @@ app.get('/', (req, res) => {
                 }
             }
 
-            // Sayfa yüklendiğinde ilk captchayı getir
             loadCaptcha();
         </script>
     </body>
