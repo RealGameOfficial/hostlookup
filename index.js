@@ -1,18 +1,26 @@
 const express = require('express');
 const whois = require('whois');
 const { exec } = require('child_process');
+const dns = require('dns');
+const net = require('net');
 const axios = require('axios');
+const svgCaptcha = require('svg-captcha');
 const app = express();
 
 const port = process.env.PORT || 10000;
 
-// Express Ayarları
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- BELLEKTE TUTULAN BASİT SİSTEMLER ---
+// --- KRİTİK: HEALTH CHECK ---
+app.get('/healthost', (req, res) => {
+    res.status(200).send('OK');
+});
+
+// Sunucu tarafında tutulan captcha kodları
 const activeCaptchas = {}; 
 
+// Hız Sınırı (Dakikada 60)
 const apiRequestCounts = {};
 setInterval(() => { Object.keys(apiRequestCounts).forEach(k => delete apiRequestCounts[k]); }, 60000);
 
@@ -21,21 +29,70 @@ function rateLimiter(req, res, next) {
     if (!apiRequestCounts[ip]) apiRequestCounts[ip] = 0;
     
     if (apiRequestCounts[ip] >= 60) {
-        return res.status(429).json({ error: 'Dakikalık istek limitini (60) aştınız. Lütfen bekleyin.' });
+        return res.status(429).json({ error: 'Dakikalık limit (60) aşıldı. Lütfen bekleyin.' });
     }
     apiRequestCounts[ip]++;
     next();
 }
 
-// --- HELPER FONKSİYONLAR ---
-function parseWhois(rawText) {
-    const info = {
-        registrar: 'Bilinmiyor',
-        creationDate: 'Bilinmiyor',
-        expiryDate: 'Bilinmiyor',
-        raw: rawText
-    };
+// Güvenli ve Akıllı Ping Sistemi (ICMP + TCP Fallback)
+function performPing(target, callback) {
+    const cleanTarget = target.replace(/[^a-zA-Z0-9.-]/g, '');
     
+    // 1. Aşama: Standart ICMP Ping dene
+    exec(`ping -c 3 -W 2 ${cleanTarget}`, (err, stdout) => {
+        if (!err && stdout) {
+            return callback(null, stdout);
+        }
+        
+        // 2. Aşama: ICMP başarısız olursa (Sunucu kısıtlaması), TCP Fallback başlat
+        const start = Date.now();
+        dns.lookup(cleanTarget, (dnsErr, address) => {
+            if (dnsErr) {
+                return callback(new Error('DNS Çözümleme Hatası: Alan adı bulunamadı.'));
+            }
+            
+            const socket = new net.Socket();
+            socket.setTimeout(2500);
+            
+            socket.on('connect', () => {
+                const duration = Date.now() - start;
+                socket.destroy();
+                callback(null, `PING SUCCESS (TCP FALLBACK)\n-------------------------\nHedef IP: ${address}\nPort: 80 (HTTP)\nGecikme Süresi: ${duration} ms\n\n(Not: Sunucuda ICMP kısıtlı olduğundan bağlantı TCP üzerinden test edilmiştir.)`);
+            });
+
+            socket.on('error', () => {
+                socket.destroy();
+                // Port 80 kapalıysa Port 443'ü dene
+                const startSecure = Date.now();
+                const secureSocket = new net.Socket();
+                secureSocket.setTimeout(2500);
+                
+                secureSocket.on('connect', () => {
+                    const duration = Date.now() - startSecure;
+                    secureSocket.destroy();
+                    callback(null, `PING SUCCESS (TCP FALLBACK)\n-------------------------\nHedef IP: ${address}\nPort: 443 (HTTPS)\nGecikme Süresi: ${duration} ms\n\n(Not: Sunucuda ICMP kısıtlı olduğundan güvenli TCP üzerinden test edilmiştir.)`);
+                });
+                
+                secureSocket.on('error', (e) => {
+                    secureSocket.destroy();
+                    callback(null, `PING FAILED\n-------------------------\nHedef IP: ${address}\nHata: Port 80 ve 443 bağlantı isteklerine yanıt vermedi.\nHata Detayı: ${e.message}`);
+                });
+                secureSocket.connect(443, address);
+            });
+
+            socket.on('timeout', () => {
+                socket.destroy();
+                callback(null, `PING TIMEOUT\n-------------------------\nHedef IP: ${address}\nDurum: 2500ms içinde bağlantı sağlanamadı.`);
+            });
+
+            socket.connect(80, address);
+        });
+    });
+}
+
+function parseWhois(rawText) {
+    const info = { registrar: 'Bilinmiyor', creationDate: 'Bilinmiyor', expiryDate: 'Bilinmiyor', raw: rawText };
     if (!rawText) return info;
 
     const lines = rawText.split('\n');
@@ -54,26 +111,31 @@ function parseWhois(rawText) {
     return info;
 }
 
-// --- 1. KAPI: DEVELOPER API ---
+// --- KULLANICI IP TESPİTİ ---
+app.get('/api/myip', (req, res) => {
+    let ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (ip.startsWith('::ffff:')) {
+        ip = ip.substring(7);
+    }
+    res.json({ ip });
+});
+
+// --- DEVELOPER API (Doğrulama Yok) ---
 app.get('/api/v1/domain', rateLimiter, (req, res) => {
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'Target parametresi eksik' });
-
     whois.lookup(target, (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
-        const parsed = parseWhois(data);
-        res.json({ type: 'domain', ...parsed });
+        res.json({ type: 'domain', ...parseWhois(data) });
     });
 });
 
 app.get('/api/v1/ip', rateLimiter, async (req, res) => {
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'Target parametresi eksik' });
-
     try {
-        const response = await axios.get(`http://ip-api.com/json/${target}?fields=status,message,country,city,isp,org,as,mobile,proxy,hosting`);
+        const response = await axios.get(`http://ip-api.com/json/${target}?fields=status,message,country,city,isp,mobile,proxy,hosting`);
         if (response.data.status !== 'success') return res.status(400).json({ error: 'IP bilgisi alınamadı' });
-        
         const d = response.data;
         res.json({
             type: 'ip',
@@ -90,43 +152,40 @@ app.get('/api/v1/ip', rateLimiter, async (req, res) => {
 app.get('/api/v1/ping', rateLimiter, (req, res) => {
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'Target parametresi eksik' });
-
-    const cleanTarget = target.replace(/[^a-zA-Z0-9.]/g, '');
-
-    exec(`ping -c 4 ${cleanTarget}`, (err, stdout, stderr) => {
-        if (err) return res.json({ result: 'Ping başarısız veya hedef bulunamadı.', raw: stderr || err.message });
-        res.json({ type: 'ping', result: stdout });
+    performPing(target, (err, result) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ type: 'ping', result });
     });
 });
 
-// --- CAPTCHA GENERATOR ---
+// --- GÜVENLİ VE GERÇEK CAPTCHA RETER ---
 app.get('/api/captcha/generate', (req, res) => {
+    // svg-captcha harfleri doğrudan eğrilere (path) dönüştürür. HTML'de yazı barınmaz.
+    const captcha = svgCaptcha.create({
+        size: 5,
+        noise: 3,
+        color: true,
+        background: '#161b22',
+        width: 140,
+        height: 45,
+        fontSize: 36
+    });
+    
     const captchaId = Math.random().toString(36).substring(2, 9);
-    const code = Math.random().toString(36).substring(2, 7).toUpperCase();
-    
-    activeCaptchas[captchaId] = code;
+    activeCaptchas[captchaId] = captcha.text.toLowerCase(); // Küçük harfe eşitleyip saklıyoruz
 
-    const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="130" height="45" viewBox="0 0 130 45">
-        <rect width="100%" height="100%" fill="#2a2a2a"/>
-        <line x1="0" y1="10" x2="130" y2="35" stroke="#555" stroke-width="2"/>
-        <line x1="10" y1="40" x2="120" y2="5" stroke="#444" stroke-width="2"/>
-        <text x="15" y="32" font-family="monospace" font-size="24" font-weight="bold" fill="#007bff" transform="rotate(-3, 65, 22)">${code}</text>
-    </svg>
-    `;
-    
-    res.json({ id: captchaId, svg: Buffer.from(svg).toString('base64') });
+    res.json({ id: captchaId, svg: Buffer.from(captcha.data).toString('base64') });
 });
 
-// --- 2. KAPI: FRONTEND API ---
+// --- FRONTEND GÜVENLİ API ---
 app.post('/api/frontend/query', rateLimiter, async (req, res) => {
     const { type, target, captchaId, captchaCode } = req.body;
 
-    if (!captchaId || !activeCaptchas[captchaId] || activeCaptchas[captchaId] !== captchaCode?.toUpperCase()) {
+    if (!captchaId || !activeCaptchas[captchaId] || activeCaptchas[captchaId] !== captchaCode?.trim().toLowerCase()) {
         return res.status(400).json({ error: 'Güvenlik kodu (Captcha) hatalı veya süresi dolmuş!' });
     }
     
-    delete activeCaptchas[captchaId];
+    delete activeCaptchas[captchaId]; // Güvenlik için kullanıldığı an imha edilir
 
     if (type === 'domain') {
         whois.lookup(target, (err, data) => {
@@ -148,17 +207,16 @@ app.post('/api/frontend/query', rateLimiter, async (req, res) => {
             return res.json({ error: 'IP sorgu hatası.' });
         }
     } else if (type === 'ping') {
-        const cleanTarget = target.replace(/[^a-zA-Z0-9.]/g, '');
-        exec(`ping -c 4 ${cleanTarget}`, (err, stdout) => {
-            if (err) return res.json({ error: 'Ping atılamadı.' });
-            return res.json({ raw: stdout });
+        performPing(target, (err, result) => {
+            if (err) return res.json({ error: err.message });
+            return res.json({ raw: result });
         });
     } else {
         return res.status(400).json({ error: 'Geçersiz işlem türü.' });
     }
 });
 
-// --- ANA SAYFA ---
+// --- DASHBOARD FRONTEND ---
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -182,7 +240,8 @@ app.get('/', (req, res) => {
             input[type="text"] { flex: 1; background: #010409; border: 1px solid var(--border); padding: 12px; border-radius: 6px; color: #fff; font-size: 16px; }
             input:focus { outline: none; border-color: var(--accent); }
             .captcha-container { display: flex; align-items: center; gap: 15px; margin-top: 5px; background: #010409; padding: 10px; border-radius: 6px; border: 1px solid var(--border); width: max-content; }
-            .captcha-img { height: 40px; border-radius: 4px; background: #2a2a2a; display: flex; align-items: center; }
+            .captcha-img { height: 45px; border-radius: 4px; background: #161b22; display: flex; align-items: center; overflow: hidden; }
+            .captcha-img svg { display: block; height: 100%; }
             .captcha-input { width: 100px !important; padding: 10px !important; text-transform: uppercase; }
             .btn-submit { background: var(--accent); color: #000; font-weight: bold; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 16px; transition: 0.2s; }
             .btn-submit:hover { opacity: 0.9; }
@@ -191,13 +250,15 @@ app.get('/', (req, res) => {
             .result-item label { font-size: 12px; color: #8b949e; display: block; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
             .result-item span { font-size: 16px; color: #fff; font-weight: 500; }
             .raw-output { margin-top: 25px; background: #010409; border: 1px solid var(--border); padding: 15px; border-radius: 6px; max-height: 250px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #8b949e; }
-            .refresh-captcha { cursor: pointer; color: var(--accent); font-size: 12px; margin-left: 5px; }
+            .refresh-captcha { cursor: pointer; color: var(--accent); font-size: 12px; margin-left: 5px; user-select: none; }
+            .client-ip-info { font-size: 13px; color: #8b949e; margin-top: -10px; display: none; }
+            .client-ip-info span { color: var(--accent); cursor: pointer; font-weight: bold; }
         </style>
     </head>
     <body>
         <div class="dashboard">
             <h1>HostLook-up</h1>
-            <div class="subtitle">Domain, IP ve Ağ Analiz Platformu (v2.0)</div>
+            <div class="subtitle">Domain, IP ve Güvenli Ağ Analiz Platformu (v2.1)</div>
             
             <div class="tabs">
                 <button class="tab-btn active" onclick="setMode('domain', 'Örn: google.com')">Domain Sorgula</button>
@@ -207,6 +268,7 @@ app.get('/', (req, res) => {
 
             <div class="card">
                 <div class="input-group">
+                    <div id="ipAutoDisplay" class="client-ip-info">İnternet Çıkış IP Adresiniz: <span id="myIpText" onclick="fillMyIp()">Yükleniyor...</span></div>
                     <div class="search-box">
                         <input type="text" id="targetInput" placeholder="Örn: google.com">
                         <button class="btn-submit" onclick="runQuery()">Sorgula</button>
@@ -214,7 +276,7 @@ app.get('/', (req, res) => {
 
                     <div class="captcha-container">
                         <div id="captchaBox" class="captcha-img">Yükleniyor...</div>
-                        <input type="text" id="captchaInput" class="captcha-input" placeholder="Kod" maxlength="5">
+                        <input type="text" id="captchaInput" class="captcha-input" placeholder="Kod" maxlength="5" autocomplete="off">
                         <span class="refresh-captcha" onclick="loadCaptcha()">🔄 Yenile</span>
                     </div>
                 </div>
@@ -227,12 +289,40 @@ app.get('/', (req, res) => {
         <script>
             let currentMode = 'domain';
             let currentCaptchaId = '';
+            let clientIp = '';
+
+            // IP Tespiti
+            async function fetchClientIp() {
+                try {
+                    const res = await fetch('/api/myip');
+                    const data = await res.json();
+                    clientIp = data.ip;
+                    document.getElementById('myIpText').innerText = clientIp;
+                } catch(e) {
+                    document.getElementById('myIpText').innerText = 'Tespit edilemedi';
+                }
+            }
+
+            function fillMyIp() {
+                if(clientIp) {
+                    document.getElementById('targetInput').value = clientIp;
+                }
+            }
 
             function setMode(mode, placeholder) {
                 currentMode = mode;
                 document.getElementById('targetInput').placeholder = placeholder;
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
                 if(event) event.target.classList.add('active');
+                
+                const ipDisplay = document.getElementById('ipAutoDisplay');
+                if(mode === 'ip') {
+                    ipDisplay.style.display = 'block';
+                    fillMyIp();
+                } else {
+                    ipDisplay.style.display = 'none';
+                }
+                
                 clearOutputs();
             }
 
@@ -247,6 +337,7 @@ app.get('/', (req, res) => {
                     const res = await fetch('/api/captcha/generate');
                     const data = await res.json();
                     currentCaptchaId = data.id;
+                    // base64 ile kodlanmış SVG içeriğini çözüp div içerisine basıyoruz
                     document.getElementById('captchaBox').innerHTML = atob(data.svg);
                 } catch (err) {
                     document.getElementById('captchaBox').innerText = 'Captcha Hatası';
@@ -279,8 +370,8 @@ app.get('/', (req, res) => {
 
                     const data = await response.json();
 
-                    if(data.error) {
-                        raw.innerText = 'Hata: ' + data.error;
+                    if(response.status !== 200 || data.error) {
+                        raw.innerText = 'Hata: ' + (data.error || 'Bilinmeyen bir hata oluştu.');
                         loadCaptcha();
                         return;
                     }
@@ -314,17 +405,15 @@ app.get('/', (req, res) => {
                 }
             }
 
+            // İlk yükleme tetikleyicileri
             loadCaptcha();
+            fetchClientIp();
         </script>
     </body>
     </html>
     `);
 });
 
-app.get('/healthost', (req, res) => {
-    res.status(200).json({ status: 'success', message: 'OK' });
-});
-
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Sunucu ${port} portunda tam donanımlı olarak yayında.`);
+    console.log(`Sunucu ${port} portunda tam donanımlı ve güvenli olarak yayında.`);
 });
