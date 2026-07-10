@@ -4,6 +4,7 @@
   "main": "index.js",
   "dependencies": {
     "express": "latest",
-    "whois": "latest"
+    "whois": "latest",
+    "axios": "latest"
   }
 }
