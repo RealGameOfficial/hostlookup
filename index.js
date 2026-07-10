@@ -68,6 +68,10 @@ app.get('/api/lookup', (req, res) => {
     });
 });
 
+app.get('/healthost', (req, res) => {
+    res.status(200).json({ status: 'success', message: 'OK' });
+});
+
 // Sunucuyu dış dünyaya (0.0.0.0) açıyoruz
 app.listen(port, '0.0.0.0', () => {
     console.log(`Sunucu ${port} portunda kesin olarak yayında.`);
