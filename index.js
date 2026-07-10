@@ -321,6 +321,10 @@ app.get('/', (req, res) => {
     `);
 });
 
+app.get('/healthost', (req, res) => {
+    res.status(200).json({ status: 'success', message: 'OK' });
+});
+
 app.listen(port, '0.0.0.0', () => {
     console.log(`Sunucu ${port} portunda tam donanımlı olarak yayında.`);
 });
