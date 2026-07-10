@@ -111,6 +111,7 @@ app.get('/api/lookup', async (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`Sunucu ${PORT} portunda çalışıyor.`);
+const port = process.env.PORT || 10000;
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Sunucu ${port} portunda çalışıyor.`);
 });
